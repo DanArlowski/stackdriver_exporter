@@ -74,3 +74,30 @@ func GetProjectIDsFromFilter(ctx context.Context, filter string) ([]string, erro
 
 	return projectIDs, nil
 }
+
+func GetNotExistingEntities(a, b []string) (inBNotInA []string, inANotInB []string) {
+	// Create a map to store elements from both slices for efficient lookup
+	exists := make(map[string]bool)
+
+	// Fill the map with elements from slice a
+	for _, v := range a {
+		exists[v] = true
+	}
+
+	// Iterate over slice b to find elements not existing in a
+	for _, v := range b {
+		if !exists[v] {
+			inBNotInA = append(inBNotInA, v)
+		} else {
+			// If the element exists in a, remove it from the map to prevent duplicates
+			delete(exists, v)
+		}
+	}
+
+	// The elements remaining in the map are those in a not existing in b
+	for k := range exists {
+		inANotInB = append(inANotInB, k)
+	}
+
+	return inBNotInA, inANotInB
+}

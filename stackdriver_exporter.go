@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/PuerkitoBio/rehttp"
 	"github.com/alecthomas/kingpin/v2"
@@ -62,6 +63,14 @@ var (
 	projectsFilter = kingpin.Flag(
 		"google.projects.filter", "Google projects search filter.",
 	).String()
+
+	pollprojectsFilterChange = kingpin.Flag(
+		"google.projects.poll-filter-changes", "periodically update the list of Google projects based on the search filter",
+	).Default("false").Bool()
+
+	projectsFilterPollInterval = kingpin.Flag(
+		"google.projects.poll-interval", "the interval between polls of updated project list based on the filter",
+	).Default("5m").Duration()
 
 	stackdriverMaxRetries = kingpin.Flag(
 		"stackdriver.max-retries", "Max number of retries that should be attempted on 503 errors from stackdriver.",
@@ -171,11 +180,13 @@ type handler struct {
 	handler http.Handler
 	logger  log.Logger
 
-	projectIDs          []string
-	metricsPrefixes     []string
-	metricsExtraFilters []collectors.MetricFilter
-	additionalGatherer  prometheus.Gatherer
-	m                   *monitoring.Service
+	projectIDs             []string
+	metricsPrefixes        []string
+	metricsExtraFilters    []collectors.MetricFilter
+	additionalGatherer     prometheus.Gatherer
+	m                      *monitoring.Service
+	projectScraperMonitors map[string]*collectors.MonitoringCollector
+	registry               *prometheus.Registry
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -186,55 +197,109 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for _, projID := range projectIDsParam {
 		projectFilters[projID] = true
 	}
-
-	h.innerHandler(collectParams, projectFilters).ServeHTTP(w, r)
-}
-
-func newHandler(projectIDs []string, metricPrefixes []string, metricExtraFilters []collectors.MetricFilter, m *monitoring.Service, logger log.Logger, additionalGatherer prometheus.Gatherer) *handler {
-	h := &handler{
-		logger:              logger,
-		projectIDs:          projectIDs,
-		metricsPrefixes:     metricPrefixes,
-		metricsExtraFilters: metricExtraFilters,
-		additionalGatherer:  additionalGatherer,
-		m:                   m,
+	if projectsFilter != nil {
+		if *pollprojectsFilterChange {
+			go h.continuouslyPollProjects(collectParams, projectFilters)
+		} else {
+			h.registerMonitoringCollectors(collectParams, projectFilters)
+		}
 	}
 
-	h.handler = h.innerHandler(nil, nil)
+	h.innerHandler().ServeHTTP(w, r)
+}
+
+func newHandler(metricPrefixes []string, metricExtraFilters []collectors.MetricFilter, m *monitoring.Service, logger log.Logger, additionalGatherer prometheus.Gatherer) *handler {
+	h := &handler{
+		logger:                 logger,
+		metricsPrefixes:        metricPrefixes,
+		metricsExtraFilters:    metricExtraFilters,
+		additionalGatherer:     additionalGatherer,
+		m:                      m,
+		registry:               prometheus.NewRegistry(),
+		projectScraperMonitors: map[string]*collectors.MonitoringCollector{},
+	}
+	h.handler = h.innerHandler()
 	return h
 }
 
-func (h *handler) innerHandler(metricFilters []string, projectFilters map[string]bool) http.Handler {
-	registry := prometheus.NewRegistry()
+func (h *handler) GetProjectIDs() []string {
+	var err error
+	var projectIDs []string
+	if *projectsFilter != "" {
+		level.Info(h.logger).Log("msg", "Using Google Cloud Projects Filter", "projectsFilter", *projectsFilter)
+		projectIDs, err = utils.GetProjectIDsFromFilter(context.Background(), *projectsFilter)
+		if err != nil {
+			level.Error(h.logger).Log("msg", "failed to get project IDs from filter", "err", err)
+			os.Exit(1)
+		}
+	}
 
-	for _, project := range h.projectIDs {
+	if *projectID != "" {
+		projectIDs = append(projectIDs, strings.Split(*projectID, ",")...)
+	}
+	level.Info(h.logger).Log("msg", "Using Google Cloud Project IDs", "projectIDs", fmt.Sprintf("%v", projectIDs))
+
+	h.projectIDs = projectIDs
+	return projectIDs
+}
+
+func (h *handler) continuouslyPollProjects(metricFilters []string, projectFilters map[string]bool) {
+
+	ticker := time.NewTicker(*projectsFilterPollInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		go h.registerMonitoringCollectors(metricFilters, projectFilters)
+	}
+}
+
+func (h *handler) registerMonitoringCollectors(metricFilters []string, projectFilters map[string]bool) {
+
+	oldProjects := h.projectIDs
+	newProjects := h.GetProjectIDs()
+
+	addedProjects, deletedProjects := utils.GetNotExistingEntities(oldProjects, newProjects)
+
+	for _, project := range addedProjects {
 		if len(projectFilters) > 0 && !projectFilters[project] {
 			continue
 		}
 
-		monitoringCollector, err := collectors.NewMonitoringCollector(project, h.m, collectors.MonitoringCollectorOptions{
-			MetricTypePrefixes:        h.filterMetricTypePrefixes(metricFilters),
-			ExtraFilters:              h.metricsExtraFilters,
-			RequestInterval:           *monitoringMetricsInterval,
-			RequestOffset:             *monitoringMetricsOffset,
-			IngestDelay:               *monitoringMetricsIngestDelay,
-			FillMissingLabels:         *collectorFillMissingLabels,
-			DropDelegatedProjects:     *monitoringDropDelegatedProjects,
-			AggregateDeltas:           *monitoringMetricsAggregateDeltas,
-			DescriptorCacheTTL:        *monitoringDescriptorCacheTTL,
-			DescriptorCacheOnlyGoogle: *monitoringDescriptorCacheOnlyGoogle,
-		}, h.logger, delta.NewInMemoryCounterStore(h.logger, *monitoringMetricsDeltasTTL), delta.NewInMemoryHistogramStore(h.logger, *monitoringMetricsDeltasTTL))
-		if err != nil {
-			level.Error(h.logger).Log("err", err)
-			os.Exit(1)
+		if _, ok := h.projectScraperMonitors[project]; !ok {
+			monitoringCollector, err := collectors.NewMonitoringCollector(project, h.m, collectors.MonitoringCollectorOptions{
+				MetricTypePrefixes:        h.filterMetricTypePrefixes(metricFilters),
+				ExtraFilters:              h.metricsExtraFilters,
+				RequestInterval:           *monitoringMetricsInterval,
+				RequestOffset:             *monitoringMetricsOffset,
+				IngestDelay:               *monitoringMetricsIngestDelay,
+				FillMissingLabels:         *collectorFillMissingLabels,
+				DropDelegatedProjects:     *monitoringDropDelegatedProjects,
+				AggregateDeltas:           *monitoringMetricsAggregateDeltas,
+				DescriptorCacheTTL:        *monitoringDescriptorCacheTTL,
+				DescriptorCacheOnlyGoogle: *monitoringDescriptorCacheOnlyGoogle,
+			}, h.logger, delta.NewInMemoryCounterStore(h.logger, *monitoringMetricsDeltasTTL), delta.NewInMemoryHistogramStore(h.logger, *monitoringMetricsDeltasTTL))
+			if err != nil {
+				level.Error(h.logger).Log("err", err)
+				os.Exit(1)
+			}
+			h.projectScraperMonitors[project] = monitoringCollector
+			h.registry.MustRegister(monitoringCollector)
 		}
-		registry.MustRegister(monitoringCollector)
+
 	}
-	var gatherers prometheus.Gatherer = registry
+	for _, project := range deletedProjects {
+		h.registry.Unregister(h.projectScraperMonitors[project])
+		delete(h.projectScraperMonitors, project)
+	}
+
+}
+
+func (h *handler) innerHandler() http.Handler {
+	var gatherers prometheus.Gatherer = h.registry
 	if h.additionalGatherer != nil {
 		gatherers = prometheus.Gatherers{
 			h.additionalGatherer,
-			registry,
+			h.registry,
 		}
 	}
 
@@ -290,34 +355,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	var projectIDs []string
-
-	if *projectsFilter != "" {
-		level.Info(logger).Log("msg", "Using Google Cloud Projects Filter", "projectsFilter", *projectsFilter)
-		projectIDs, err = utils.GetProjectIDsFromFilter(ctx, *projectsFilter)
-		if err != nil {
-			level.Error(logger).Log("msg", "failed to get project IDs from filter", "err", err)
-			os.Exit(1)
-		}
-	}
-
-	if *projectID != "" {
-		projectIDs = append(projectIDs, strings.Split(*projectID, ",")...)
-	}
-
-	level.Info(logger).Log("msg", "Using Google Cloud Project IDs", "projectIDs", fmt.Sprintf("%v", projectIDs))
-
 	metricsTypePrefixes := strings.Split(*monitoringMetricsTypePrefixes, ",")
 	metricExtraFilters := parseMetricExtraFilters()
 
 	if *metricsPath == *stackdriverMetricsPath {
 		handler := newHandler(
-			projectIDs, metricsTypePrefixes, metricExtraFilters, monitoringService, logger, prometheus.DefaultGatherer)
+			metricsTypePrefixes, metricExtraFilters, monitoringService, logger, prometheus.DefaultGatherer)
 		http.Handle(*metricsPath, promhttp.InstrumentMetricHandler(prometheus.DefaultRegisterer, handler))
 	} else {
 		level.Info(logger).Log("msg", "Serving Stackdriver metrics at separate path", "path", *stackdriverMetricsPath)
 		handler := newHandler(
-			projectIDs, metricsTypePrefixes, metricExtraFilters, monitoringService, logger, nil)
+			metricsTypePrefixes, metricExtraFilters, monitoringService, logger, nil)
 		http.Handle(*stackdriverMetricsPath, promhttp.InstrumentMetricHandler(prometheus.DefaultRegisterer, handler))
 		http.Handle(*metricsPath, promhttp.Handler())
 	}
